@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -45,6 +47,42 @@ kvminit()
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+}
+
+pagetable_t
+kvmpinit()
+{
+  pagetable_t kpgtable = (pagetable_t)kalloc();
+  memset(kpgtable, 0, PGSIZE);
+
+  // Map the same devices and kernel memory as the global kernel page table.
+  mappages(kpgtable, UART0, PGSIZE, UART0, PTE_R | PTE_W);
+  mappages(kpgtable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W);
+  mappages(kpgtable, CLINT, 0x10000, CLINT, PTE_R | PTE_W);
+  mappages(kpgtable, PLIC, 0x400000, PLIC, PTE_R | PTE_W);
+  mappages(kpgtable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X);
+  mappages(kpgtable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W);
+  mappages(kpgtable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X);
+
+  return kpgtable;
+}
+
+void kvmpfree(pagetable_t kpagetable)
+{
+  if (kpagetable == 0)
+    return;
+
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = kpagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
+    {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      kvmpfree((pagetable_t)child);
+    }
+  }
+  kfree((void *)kpagetable);
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -131,8 +169,8 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
+
+  pte = walk(myproc()->kpagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)

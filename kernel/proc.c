@@ -20,6 +20,8 @@ static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+extern pagetable_t kernel_pagetable;
+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc);
 
 // initialize the proc table at boot time.
 void
@@ -121,6 +123,36 @@ found:
     return 0;
   }
 
+  // Create per-process kernel page table.
+  p->kpagetable = kvmpinit();
+  if (p->kpagetable == 0)
+  {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  char *kpa = kalloc();
+  if (kpa == 0)
+  {
+    kvmpfree(p->kpagetable);
+    p->kpagetable = 0;
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  uint64 kva = KSTACK((int)(p - proc));
+  if (mappages(p->kpagetable, kva, PGSIZE, (uint64)kpa, PTE_R | PTE_W) != 0)
+  {
+    kfree(kpa);
+    kvmpfree(p->kpagetable);
+    p->kpagetable = 0;
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->kstack = kva;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,6 +173,23 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+
+  if (p->kstack)
+  {
+    pte_t *pte = walk(p->kpagetable, p->kstack, 0);
+    if (pte == 0)
+    {
+      panic("freeproc: pte should exist");
+    }
+    kfree((void *)PTE2PA(*pte));
+  }
+
+  if (p->kpagetable)
+  {
+    kvmpfree(p->kpagetable);
+    p->kpagetable = 0;
+  }
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -471,6 +520,9 @@ scheduler(void)
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
@@ -486,6 +538,8 @@ scheduler(void)
 #if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       asm volatile("wfi");
     }
 #else
