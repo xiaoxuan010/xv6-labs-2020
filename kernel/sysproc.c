@@ -43,14 +43,34 @@ sys_sbrk(void)
 {
   int addr;
   int n;
+  struct proc *p = myproc();
 
   if(argint(0, &n) < 0)
     return -1;
-  addr = myproc()->sz;
-  myproc()->sz += n;
+  addr = p->sz;
 
-  // if(growproc(n) < 0)
-  //   return -1;
+  if (n < 0)
+  {
+    // Deallocate memory for negative sbrk; avoid unsigned underflow.
+    uint64 new_sz;
+    uint64 shrink = (uint64)(-n);
+    if (shrink > p->sz)
+      new_sz = 0;
+    else
+      new_sz = p->sz - shrink;
+    p->sz = uvmdealloc(p->pagetable, p->sz, new_sz);
+  }
+  else if (n > 0)
+  {
+    // Prevent growing into TRAPFRAME/TRAMPOLINE area.
+    // User memory must always be strictly below TRAPFRAME.
+    uint64 add = (uint64)n;
+    if (add > (TRAPFRAME > p->sz ? (TRAPFRAME - p->sz) : 0))
+      return (uint64)-1; // fail if it would exceed user address space limit
+    // Lazy allocation: just record the size increase.
+    p->sz += add;
+  }
+
   return addr;
 }
 

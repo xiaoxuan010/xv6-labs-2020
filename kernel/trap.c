@@ -6,6 +6,9 @@
 #include "proc.h"
 #include "defs.h"
 
+// needed to inspect PTEs to avoid remapping guard pages
+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc);
+
 struct spinlock tickslock;
 uint ticks;
 
@@ -74,34 +77,47 @@ usertrap(void)
     {
       uint64 va = r_stval(); // faulting virtual address
 
-      // Check if the fault is within the valid address range
-      if (va >= p->sz || va >= MAXVA)
+      // 检查地址是否合法
+      if (va == 0 || va >= MAXVA || va >= p->sz || va < 0)
       {
+        p->killed = 1;
+      }
+      else if (va >= TRAMPOLINE - PGSIZE && va < TRAMPOLINE)
+      {
+        // 不能访问 trampoline 或 trapframe
         p->killed = 1;
       }
       else
       {
         // Round down to page boundary
         va = PGROUNDDOWN(va);
-
-        // Allocate physical memory
-        char *mem = kalloc();
-        if (mem == 0)
+        // 如果该地址的 PTE 已存在但不允许用户访问，则应视为 guard page，不能映射
+        pte_t *pte_chk = walk(p->pagetable, va, 0);
+        if (pte_chk && (*pte_chk & PTE_V) && ((*pte_chk & PTE_U) == 0))
         {
+          p->killed = 1;
+        }
+        else if (va >= p->sz)
+        {
+          // 不能分配到 sz 以上的页面
           p->killed = 1;
         }
         else
         {
-          // Zero out the memory
-          memset(mem, 0, PGSIZE);
-
-          // Map the page into the process's page table
-          if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+          char *mem = kalloc();
+          if (mem == 0)
           {
-            kfree(mem);
             p->killed = 1;
           }
-          // If successful, the fault is handled and we continue execution
+          else
+          {
+            memset(mem, 0, PGSIZE);
+            if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+            {
+              kfree(mem);
+              p->killed = 1;
+            }
+          }
         }
       }
     }

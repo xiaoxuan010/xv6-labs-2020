@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+// for myproc()->sz in lazy allocation paths used by copyin/copyout
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -188,6 +191,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not a leaf");
     if(do_free){
       uint64 pa = PTE2PA(*pte);
+      // Zero the physical page before freeing so that future lazy
+      // allocations see a clean page (also defensive hygiene).
+      memset((void *)pa, 0, PGSIZE);
       kfree((void*)pa);
     }
     *pte = 0;
@@ -359,8 +365,41 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if (pa0 == 0)
+    {
+      if (va0 >= MAXVA)
+        return -1;
+      // If there's a present PTE but not user-accessible, it's a guard page.
+      pte_t *pte_chk = walk(pagetable, va0, 0);
+      if (pte_chk && (*pte_chk & PTE_V) && ((*pte_chk & PTE_U) == 0))
+        return -1;
+      // attempt lazy allocation if this is the current process's pagetable
+      struct proc *p = myproc();
+      if (p && p->pagetable == pagetable)
+      {
+        // don't allow beyond process size
+        if (va0 >= p->sz)
+          return -1;
+
+        char *mem = kalloc();
+        if (mem == 0)
+          return -1;
+        memset(mem, 0, PGSIZE);
+        if (mappages(pagetable, va0, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+        {
+          kfree(mem);
+          return -1;
+        }
+        // try again after mapping
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
+      }
+      else
+      {
+        return -1;
+      }
+    }
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -384,8 +423,37 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if (pa0 == 0)
+    {
+      if (va0 >= MAXVA)
+        return -1;
+      pte_t *pte_chk = walk(pagetable, va0, 0);
+      if (pte_chk && (*pte_chk & PTE_V) && ((*pte_chk & PTE_U) == 0))
+        return -1;
+      // attempt lazy allocation for current process
+      struct proc *p = myproc();
+      if (p && p->pagetable == pagetable)
+      {
+        if (va0 >= p->sz)
+          return -1;
+        char *mem = kalloc();
+        if (mem == 0)
+          return -1;
+        memset(mem, 0, PGSIZE);
+        if (mappages(pagetable, va0, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+        {
+          kfree(mem);
+          return -1;
+        }
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
+      }
+      else
+      {
+        return -1;
+      }
+    }
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
@@ -411,8 +479,36 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   while(got_null == 0 && max > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if (pa0 == 0)
+    {
+      if (va0 >= MAXVA)
+        return -1;
+      pte_t *pte_chk = walk(pagetable, va0, 0);
+      if (pte_chk && (*pte_chk & PTE_V) && ((*pte_chk & PTE_U) == 0))
+        return -1;
+      struct proc *p = myproc();
+      if (p && p->pagetable == pagetable)
+      {
+        if (va0 >= p->sz)
+          return -1;
+        char *mem = kalloc();
+        if (mem == 0)
+          return -1;
+        memset(mem, 0, PGSIZE);
+        if (mappages(pagetable, va0, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+        {
+          kfree(mem);
+          return -1;
+        }
+        pa0 = walkaddr(pagetable, va0);
+        if (pa0 == 0)
+          return -1;
+      }
+      else
+      {
+        return -1;
+      }
+    }
     n = PGSIZE - (srcva - va0);
     if(n > max)
       n = max;
