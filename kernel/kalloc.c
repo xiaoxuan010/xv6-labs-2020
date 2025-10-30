@@ -23,10 +23,22 @@ struct {
   struct run *freelist;
 } kmem;
 
+// Number of physical pages managed (from KERNBASE to PHYSTOP).
+#define NPHYS_PAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+// Reference count per physical page. 0 means free (on freelist).
+static int page_refcnt[NPHYS_PAGES];
+
+static inline int
+pa2idx(uint64 pa)
+{
+  return (pa - KERNBASE) / PGSIZE;
+}
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  // refcounts are zero-initialized (free pages). freereange will fill freelist.
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -74,9 +86,46 @@ kalloc(void)
   r = kmem.freelist;
   if(r)
     kmem.freelist = r->next;
+  // If we got a page, mark its refcount as 1 (owned by caller).
+  if (r)
+  {
+    int idx = pa2idx((uint64)r);
+    page_refcnt[idx] = 1;
+  }
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+// Increase the reference count for the page at pa.
+void incref(uint64 pa)
+{
+  int idx = pa2idx(pa);
+  acquire(&kmem.lock);
+  page_refcnt[idx]++;
+  release(&kmem.lock);
+}
+
+// Decrease the reference count for the page at pa and return the new count.
+int decref(uint64 pa)
+{
+  int idx = pa2idx(pa);
+  int rc;
+  acquire(&kmem.lock);
+  rc = --page_refcnt[idx];
+  release(&kmem.lock);
+  return rc;
+}
+
+// Get current reference count for page at pa.
+int getref(uint64 pa)
+{
+  int idx = pa2idx(pa);
+  int rc;
+  acquire(&kmem.lock);
+  rc = page_refcnt[idx];
+  release(&kmem.lock);
+  return rc;
 }

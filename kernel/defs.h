@@ -63,6 +63,10 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+// page reference counting for COW
+void incref(uint64 pa);
+int decref(uint64 pa);
+int getref(uint64 pa);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -171,6 +175,8 @@ uint64          walkaddr(pagetable_t, uint64);
 int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
+// COW helper: resolve a COW fault on a single user page at va
+int cow_copy_on_write(pagetable_t, uint64);
 
 // plic.c
 void            plicinit(void);
