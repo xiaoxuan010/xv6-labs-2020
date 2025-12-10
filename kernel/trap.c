@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -67,7 +71,77 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  }
+  else if (r_scause() == 13 || r_scause() == 15)
+  {
+    // 处理缺页异常 (Handle page fault)
+    uint64 va = r_stval();
+    struct proc *p = myproc();
+    struct vma *v = 0;
+    int i;
+
+    // 检查是否在 VMA 范围内 (Check if within VMA)
+    for (i = 0; i < NVMA; i++)
+    {
+      if (p->vma[i].used && va >= p->vma[i].addr && va < p->vma[i].addr + p->vma[i].length)
+      {
+        v = &p->vma[i];
+        break;
+      }
+    }
+
+    if (v)
+    {
+      // Check if already mapped (permission fault)
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if (pte && (*pte & PTE_V))
+      {
+        p->killed = 1;
+      }
+      else
+      {
+        // 分配物理页面 (Allocate physical page)
+        char *mem = kalloc();
+        if (mem == 0)
+        {
+          p->killed = 1;
+        }
+        else
+        {
+          memset(mem, 0, PGSIZE);
+          uint64 va_aligned = PGROUNDDOWN(va);
+          uint64 offset = v->offset + (va_aligned - v->addr);
+
+          // 从文件读取内容到页面 (Read from file to page)
+          ilock(v->f->ip);
+          readi(v->f->ip, 0, (uint64)mem, offset, PGSIZE);
+          iunlock(v->f->ip);
+
+          int perm = PTE_U;
+          if (v->prot & PROT_READ)
+            perm |= PTE_R;
+          if (v->prot & PROT_WRITE)
+            perm |= PTE_W;
+          if (v->prot & PROT_EXEC)
+            perm |= PTE_X;
+
+          if (mappages(p->pagetable, va_aligned, PGSIZE, (uint64)mem, perm) != 0)
+          {
+            kfree(mem);
+            p->killed = 1;
+          }
+        }
+      }
+    }
+    else
+    {
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      p->killed = 1;
+    }
+  }
+  else
+  {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
