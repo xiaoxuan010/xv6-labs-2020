@@ -484,3 +484,108 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, fd, offset;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  int i;
+
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0 || argint(2, &prot) < 0 ||
+     argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 || argint(5, &offset) < 0)
+    return -1;
+
+  if(length == 0)
+    return -1;
+
+  if(f->type != FD_INODE)
+    return -1;
+
+  if((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable)
+    return -1;
+
+  // 找到未使用的 VMA (Find unused VMA)
+  for(i = 0; i < NVMA; i++){
+    if(p->vma[i].used == 0){
+      v = &p->vma[i];
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1;
+
+  // 使用 p->sz 作为起始地址，并对齐到页面边界 (Use p->sz as start address, aligned)
+  uint64 start = PGROUNDUP(p->sz);
+  
+  if(start + length > MAXVA)
+    return -1;
+    
+  v->used = 1;
+  v->addr = start;
+  v->length = length;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = f;
+  v->offset = offset;
+  
+  filedup(f);
+  
+  p->sz = start + length;
+  
+  return start;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  int i;
+
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+
+  for(i = 0; i < NVMA; i++){
+    if(p->vma[i].used && addr >= p->vma[i].addr && addr < p->vma[i].addr + p->vma[i].length){
+      v = &p->vma[i];
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1;
+    
+  if(addr + length > v->addr + v->length)
+    return -1;
+
+  if(v->flags & MAP_SHARED) {
+    for(uint64 a = addr; a < addr + length; a += PGSIZE){
+      pte_t *pte = walk(p->pagetable, a, 0);
+      if(pte && (*pte & PTE_V) && (*pte & PTE_D)){
+        filewrite(v->f, a, PGSIZE);
+      }
+    }
+  }
+  
+  uvmunmap(p->pagetable, addr, length/PGSIZE, 1);
+
+  if(addr == v->addr && length == v->length) {
+    fileclose(v->f);
+    v->used = 0;
+  } else if(addr == v->addr) {
+    v->addr += length;
+    v->length -= length;
+    v->offset += length;
+  } else if(addr + length == v->addr + v->length) {
+    v->length -= length;
+  }
+  
+  return 0;
+}
